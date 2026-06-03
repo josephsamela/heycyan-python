@@ -7,8 +7,6 @@ logging.basicConfig(level=logging.INFO)
 class HeyCyan:
     def __init__(self, device_address):
         self.client = BleakClient(device_address)
-        self.char_write = DEVICE_WRITE_CHARACTERISTIC
-        self.char_notify = DEVICE_NOTIFY_CHARACTERISTIC
         
         # DEVICE VERSION INFO
         self.software_version = ''
@@ -27,7 +25,15 @@ class HeyCyan:
         self.ble_photo_current_page_total_chunks = 5
         self.ble_photo_current_chunk = 0
 
+    @property
+    def ble_photo_transfer_progress(self):
+        return self.ble_photo_current_page / self.ble_photo_total_pages
+
     async def _init(self):
+        '''
+        Setup new device by connecting over BLE. Once connected, subscribe to 
+        DEVICE_NOTIFY_CHARACTERISTIC and get device power and version information.
+        '''
         await self.connect()
         await self.subscribe()
         await self.get_power_info()
@@ -52,14 +58,18 @@ class HeyCyan:
 
     async def subscribe(self):
         '''
-        Subscribe to device NOTIFY characteristic.
-        Any notification published by device goes to the notification_router() 
-        where it is routed to the correct callback function based on the message id.
+        Subscribe to device DEVICE_NOTIFY_CHARACTERISTIC. Any notification published 
+        by device goes to the notification_router() where it is routed to the correct
+        callback function based on the message id.
         '''
-        await self.client.start_notify(self.char_notify, self.notification_router)
+        await self.client.start_notify(DEVICE_NOTIFY_CHARACTERISTIC, self.notification_router)
 
     async def write(self, msg):
-        await self.client.write_gatt_char(self.char_write, bytes(msg))
+        '''
+        Write msg to DEVICE_WRITE_CHARACTERISTIC. The response to any request written 
+        to the device is published as a notification to the DEVICE_NOTIFY_CHARACTERISTIC
+        '''
+        await self.client.write_gatt_char(DEVICE_WRITE_CHARACTERISTIC, bytes(msg))
 
     async def notification_router(self, sender, msg):
         '''
@@ -76,7 +86,7 @@ class HeyCyan:
         '''
         msg = HeyCyanMessage(msg)
 
-        # logging.info(f'{sender} {msg.msg}')
+        logging.debug(f'{sender} {msg.msg}')
 
         match msg.id:
             
@@ -96,8 +106,8 @@ class HeyCyan:
 
                     case 2:
                         # Recording has started.
-                        # This application only wants uses to take BLE photos. If user triggers another device function
-                        # such as recording video, recording audio or AI voice mode; send message to stop that function
+                        # This application only wants users to take BLE photos. If user triggers another device function
+                        # such as recording video, recording audio, or AI voice mode; send message to stop that function
                         # and take a BLE photo instead.
                         await self.write(MSG_VOICE_MODE_STOP)
                         await self.write(MSG_RECORD_VIDEO_STOP)
@@ -114,7 +124,7 @@ class HeyCyan:
                         # If BLE photo was taken, reset photo buffer and start data transfer by requesting
                         # the first (ie. Zeroth) page of data. Subsequent pages are called after first is received.
                         self.ble_photo = []
-                        await self.ble_photo_req_page(page=0)            
+                        await self.ble_photo_req_page(page=0)
 
             case 253: 
                 # First chunk of new BLE Photo page is received.
@@ -153,6 +163,9 @@ class HeyCyan:
             self.power_source = 'battery'
 
     async def get_version_info(self):
+        '''
+        Send MSG_GET_VERSION_INFO to request device version info.
+        '''
         await self.write(MSG_GET_VERSION_INFO)
 
     async def get_power_info(self):
@@ -171,11 +184,11 @@ class HeyCyan:
         '''
         Request page of BLE Photo data.
 
-        Device takes BLE Photos that are JFIF Images at 384 x 288 resolution. Device transfers photo
-        data over BLE in pages. Each page is recieved in multiple notification messages (ie. chunks).
-        After all chunks of a page are received, request the next page. For example:
+        Device transfers photos over BLE as JFIF Images at 384 x 288 resolution. Image data transfer is paginated. 
+        Each page is recieved in multiple notification messages (ie. chunks). Start by requesting the first page. 
+        Receive all chunks of that page. Then request the next page, and so on. For example:
 
-        CLIENT REQUEST                 | DEVICE NOTIFY
+        CLIENT REQUEST                   DEVICE NOTIFY
 
         MSG_TRANSFER_PHOTO_BLE_PAGE_0 ->
                                       <- BLE_PHOTO_PAGE_0_CHUNK_0
@@ -195,41 +208,12 @@ class HeyCyan:
 
         Continue until all photo data is received.
         '''
-        cmds = [
-            MSG_TRANSFER_PHOTO_BLE_PAGE_0,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_1,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_2,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_3,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_4,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_5,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_6,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_7,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_8,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_9,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_10,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_11,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_12,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_13,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_14,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_15,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_16,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_17,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_18,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_19,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_20,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_21,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_22,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_23,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_24,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_25,
-            MSG_TRANSFER_PHOTO_BLE_PAGE_26
-        ]
-        if page >= len(cmds):
+        if page >= len(MSG_TRANSFER_PHOTO_BLE_PAGES):
             # If image filesize is large and requires more pages then 
             # there are page request commands for, save incomplete image.
             await self.ble_photo_save()
         else:    
-            await self.write(cmds[page])
+            await self.write(MSG_TRANSFER_PHOTO_BLE_PAGES[page])
 
     async def ble_photo_data(self, msg):
         '''
@@ -274,9 +258,7 @@ class HeyCyan:
 
 class HeyCyanMessage:
     def __init__(self, msg):
-
         self.msg = list(msg)
-
         match self.msg[0]:
             case 188:
                 self.header = self.msg[0:11]
