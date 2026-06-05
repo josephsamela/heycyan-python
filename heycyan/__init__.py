@@ -11,9 +11,7 @@ class HeyCyan:
     def __init__(self, device_name, device_address):
         self.device_name = device_name
         self.device_address = device_address
-        
         self.client = None
-        self.connected = None
 
         # DEVICE VERSION INFO
         self.software_version = ''
@@ -32,35 +30,46 @@ class HeyCyan:
         self.ble_photo_current_page_total_chunks = 5
         self.ble_photo_current_chunk = 0
 
+        # DEVICE BACKGROUND THREAD
         self._loop = asyncio.new_event_loop()
+        self._running = True
         self._thread = threading.Thread(target=self.start)
         self._thread.start()
-        self.running = True
+
+    @property
+    def connected(self):
+        if self.client and self.client.is_connected:
+            return True
+        else:
+            return False
 
     def start(self):
+        '''
+        Device setup. Run ._init() to connect device then keep event loop running.
+        '''
         asyncio.run_coroutine_threadsafe(self._init(), self._loop)
         self._loop.run_forever()
 
     def stop(self):
-        self.running = False
+        '''
+        Device teardown. Gracefully disconnect from device and stop the event loop.
+        '''
+        # Signal thread to stop
+        self._running = False
 
-        if self.client:
+        # Disconnect from device
+        if self.client.is_connected:
             future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self._loop)
             future.result()
 
+        # Cancel all tasks in the event loop
         tasks = [t for t in asyncio.all_tasks(self._loop)]            
         if not tasks:
             for task in tasks:
                 task.cancel()
 
+        # Then stop the event loop
         self._loop.stop()
-
-    @property
-    def ble_photo_transfer_progress(self):
-        try:
-            return self.ble_photo_current_page / self.ble_photo_total_pages
-        except:
-            return None
 
     async def _init(self):
         '''
@@ -68,19 +77,17 @@ class HeyCyan:
         DEVICE_NOTIFY_CHARACTERISTIC and get device power and version information.
         '''
         attempt=1
-        while not self.connected and self.running:
+        while not self.client or not self.client.is_connected and self._running:
             try:
                 logging.info(f'Connecting to {self.device_name}...')
                 await self.connect()
                 await self.subscribe()
                 await self.get_power_info()
                 await self.get_version_info()
-                self.connected = True
                 logging.info(f'Connected to {self.device_name} software {self.software_version} battery {self.battery}%')
             except:
                 logging.info(f'Failed to connect to {self.device_name}. Attempt {attempt}')
                 attempt+=1
-                if attempt > 999: return
 
     async def connect(self):
         '''
@@ -98,7 +105,6 @@ class HeyCyan:
         '''
         Callback when device disconnect. On disconnect call self._init() to reconnect the device.
         '''
-        self.connected = False
         logging.info(f'Device {self.device_name} disconnected')
         asyncio.run_coroutine_threadsafe(
             coro=self._init(),
@@ -318,8 +324,3 @@ class HeyCyanMessage:
                 self.payload = self.msg
                 self.id = 'chunk'
                 self.action = None
-
-# async def device(device_name, device_id):
-#     glass = HeyCyan(device_name, device_id)
-#     await glass._init()
-#     return glass
