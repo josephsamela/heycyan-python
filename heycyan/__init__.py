@@ -1,13 +1,20 @@
-from bleak import BleakClient
-from .constants import *
+import asyncio
+from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
+import threading
 
 import logging
 logging.basicConfig(level=logging.INFO)
 
+from .constants import *
+
 class HeyCyan:
-    def __init__(self, device_address):
-        self.client = BleakClient(device_address)
+    def __init__(self, device_name, device_address):
+        self.device_name = device_name
+        self.device_address = device_address
         
+        self.client = None
+        self.connected = None
+
         # DEVICE VERSION INFO
         self.software_version = ''
         self.hardware_version = ''
@@ -25,36 +32,78 @@ class HeyCyan:
         self.ble_photo_current_page_total_chunks = 5
         self.ble_photo_current_chunk = 0
 
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self.start)
+        self._thread.start()
+        self.running = True
+
+    def start(self):
+        asyncio.run_coroutine_threadsafe(self._init(), self._loop)
+        self._loop.run_forever()
+
+    def stop(self):
+        self.running = False
+
+        if self.client:
+            future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self._loop)
+            future.result()
+
+        tasks = [t for t in asyncio.all_tasks(self._loop)]            
+        if not tasks:
+            for task in tasks:
+                task.cancel()
+
+        self._loop.stop()
+
     @property
     def ble_photo_transfer_progress(self):
-        return self.ble_photo_current_page / self.ble_photo_total_pages
+        try:
+            return self.ble_photo_current_page / self.ble_photo_total_pages
+        except:
+            return None
 
     async def _init(self):
         '''
         Setup new device by connecting over BLE. Once connected, subscribe to 
         DEVICE_NOTIFY_CHARACTERISTIC and get device power and version information.
         '''
-        await self.connect()
-        await self.subscribe()
-        await self.get_power_info()
-        await self.get_version_info()
-        logging.info(f'Connected to {self.client.name} software {self.software_version} battery {self.battery}%')
+        attempt=1
+        while not self.connected and self.running:
+            try:
+                logging.info(f'Connecting to {self.device_name}...')
+                await self.connect()
+                await self.subscribe()
+                await self.get_power_info()
+                await self.get_version_info()
+                self.connected = True
+                logging.info(f'Connected to {self.device_name} software {self.software_version} battery {self.battery}%')
+            except:
+                logging.info(f'Failed to connect to {self.device_name}. Attempt {attempt}')
+                attempt+=1
+                if attempt > 999: return
 
-    async def connect(self, retry=0):
+    async def connect(self):
         '''
         Connect to BLE device. Retry failed connect up to retry_attempts.
         '''
-        logging.info(f'Connect to {self.client.address}...')
-        while not self.client.is_connected:
-            try:
-                await self.client.connect()
-                logging.info(f'Connected to {self.client.address}')
-                return
-            except:
-                retry += 1
-                logging.info(f'Connect Failed. Retry {retry}')
-            if retry >= 5:
-                raise Exception(f'Could not connect to {self.client.address} after {retry} failed connection attempts.')
+        self.client = await establish_connection(
+            BleakClientWithServiceCache,
+            device=self.device_address,
+            name=self.device_name,
+            max_attempts=3,
+            disconnected_callback=self.disconnect
+        )
+
+    def disconnect(self, client):
+        '''
+        Callback when device disconnect. On disconnect call self._init() to reconnect the device.
+        '''
+        self.connected = False
+        logging.info(f'Device {self.device_name} disconnected')
+        asyncio.run_coroutine_threadsafe(
+            coro=self._init(),
+            loop=asyncio.get_running_loop()
+        )
 
     async def subscribe(self):
         '''
@@ -74,8 +123,7 @@ class HeyCyan:
     async def notification_router(self, sender, msg):
         '''
         Recieve device notifications and route them to the correct callback function based on the message id.
-
-        For purposes of this application there are three types of message ID we're interested in.
+        For purposes of this application there are only a few types of message ID we're interested in.
 
         MSG_ID    DESCRIPTION
         66        Response to MSG_GET_POWER_INFO.
@@ -85,17 +133,17 @@ class HeyCyan:
         'chunk'   Chunk of a multi-part message.
         '''
         msg = HeyCyanMessage(msg)
-
         logging.debug(f'{sender} {msg.msg}')
 
         match msg.id:
-            
+
             case 66:
                 # Response to MSG_GET_POWER_INFO
                 await self.update_power_info(
                     battery=msg.header[6],
                     source=msg.header[7]
                 )
+
             case 67:
                 # Response to MSG_GET_VERSION_INFO
                 await self.update_version_info(msg)
@@ -126,7 +174,7 @@ class HeyCyan:
                         self.ble_photo = []
                         await self.ble_photo_req_page(page=0)
 
-            case 253: 
+            case 253:
                 # First chunk of new BLE Photo page is received.
                 if msg.header[3] == 0:
                     # If this is the final page, photo transfer is done, save photo.
@@ -271,7 +319,7 @@ class HeyCyanMessage:
                 self.id = 'chunk'
                 self.action = None
 
-async def device(device_id):
-    glass = HeyCyan(device_id)
-    await glass._init()
-    return glass
+# async def device(device_name, device_id):
+#     glass = HeyCyan(device_name, device_id)
+#     await glass._init()
+#     return glass
