@@ -1,6 +1,7 @@
 import asyncio
-from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
 import threading
+import time
+from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -27,8 +28,11 @@ class HeyCyan:
         self.ble_photo = []
         self.ble_photo_current_page = 0
         self.ble_photo_total_pages = 0
-        self.ble_photo_current_page_total_chunks = 5
+        self.ble_photo_current_page_total_chunks = 6
         self.ble_photo_current_chunk = 0
+        self.ble_page_transfer_in_progress = False
+        self.filename = None
+        self.img_available = False
 
         # DEVICE BACKGROUND THREAD
         self._loop = asyncio.new_event_loop()
@@ -58,7 +62,7 @@ class HeyCyan:
         self._running = False
 
         # Disconnect from device
-        if self.client.is_connected:
+        if self.client and self.client.is_connected:
             future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self._loop)
             future.result()
 
@@ -77,7 +81,11 @@ class HeyCyan:
         DEVICE_NOTIFY_CHARACTERISTIC and get device power and version information.
         '''
         attempt=1
-        while not self.client or not self.client.is_connected and self._running:
+        while not self.client or not self.client.is_connected:
+
+            if not self._running:
+                return
+
             try:
                 logging.info(f'Connecting to {self.device_name}...')
                 await self.connect()
@@ -141,6 +149,10 @@ class HeyCyan:
         msg = HeyCyanMessage(msg)
         logging.debug(f'{sender} {msg.msg}')
 
+        if self.ble_page_transfer_in_progress and len(msg.payload) > 11:
+            await self.ble_photo_data(msg)
+            return
+
         match msg.id:
 
             case 66:
@@ -177,14 +189,16 @@ class HeyCyan:
                         # BLE Photo was taken.
                         # If BLE photo was taken, reset photo buffer and start data transfer by requesting
                         # the first (ie. Zeroth) page of data. Subsequent pages are called after first is received.
+                        logging.info(f'{self.device_name} took a BLE Photo')
                         self.ble_photo = []
+                        self.filename = f'{time.time()}+.jpg'
                         await self.ble_photo_req_page(page=0)
 
             case 253:
                 # First chunk of new BLE Photo page is received.
                 if msg.header[3] == 0:
                     # If this is the final page, photo transfer is done, save photo.
-                    await self.ble_photo_save()
+                    await self.ble_photo_data(msg, final_page=True)
                 else:
                     # If there are more pages, keep requesting data.
                     await self.ble_photo_data(msg)
@@ -192,6 +206,9 @@ class HeyCyan:
             case 'chunk':
                 # Chunk of BLE Photo data page was received.
                 await self.ble_photo_data(msg)
+
+            case _:
+                logging.info(f'{msg.header} {msg.payload}')
 
     async def update_version_info(self, msg):   
         '''
@@ -262,6 +279,7 @@ class HeyCyan:
 
         Continue until all photo data is received.
         '''
+        logging.info(f'{self.device_name} Requesting BLE Photo page {page} / {self.ble_photo_total_pages}')
         if page >= len(MSG_TRANSFER_PHOTO_BLE_PAGES):
             # If image filesize is large and requires more pages then 
             # there are page request commands for, save incomplete image.
@@ -269,7 +287,7 @@ class HeyCyan:
         else:    
             await self.write(MSG_TRANSFER_PHOTO_BLE_PAGES[page])
 
-    async def ble_photo_data(self, msg):
+    async def ble_photo_data(self, msg, final_page=False):
         '''
         Handle received BLE Photo data. BLE Photo data is received in multiple PAGES. Each PAGE 
         is split across multiple CHUNKS. Only the first CHUNK of each PAGE contains a header.
@@ -277,25 +295,36 @@ class HeyCyan:
 
         When the last chunk of a page is received, request the next page.
         '''
+        # Add chunk of photo data to BLE Photo
+        self.ble_photo.append(msg.payload)
+
         # If message contains a header, then it's the start of a new page.
         # Reset fields used to track current page and chunk.
         if msg.header:
-            self.ble_photo_total_pages = msg.header[7]
+
+            if len(msg.header) < 9:
+                return
+
+            self.ble_photo_total_pages = msg.header[7]-1
             self.ble_photo_current_page = msg.header[9]
             self.ble_photo_current_chunk = 0
+            self.ble_page_transfer_in_progress = True
 
             if msg.header[2] == 250:
                 self.ble_photo_current_page_total_chunks = 6
-            else:
-                self.ble_photo_current_page_total_chunks = 0
 
-        # Add chunk of photo data to BLE Photo
-        self.ble_photo.append(msg.payload)
+        if self.ble_photo_total_pages > 0 and self.ble_photo_current_page >= self.ble_photo_total_pages:
+            self.ble_page_transfer_in_progress = False
+
+        # Save photo
+        await self.ble_photo_save()
 
         # Increment current page-chunk counter
         self.ble_photo_current_chunk += 1
 
-        # If this is the final chunk of a page, request the next page
+        logging.info(f'Received page {self.ble_photo_current_page} / {self.ble_photo_total_pages} chunk {self.ble_photo_current_chunk} / {self.ble_photo_current_page_total_chunks}')
+
+        # If this is the final chunk of the current page, request the next page
         if self.ble_photo_current_chunk >= self.ble_photo_current_page_total_chunks:
             await self.ble_photo_req_page(self.ble_photo_current_page+1)
 
@@ -307,8 +336,10 @@ class HeyCyan:
         img=[]
         for chunk in self.ble_photo:
             img.extend(chunk)
-        with open("image.jpg", "wb") as f:
+        with open(self.filename, "wb") as f:
             f.write(bytes(img))
+        self.img_available = True
+        logging.debug(f'Saved {self.device_name} BLE Photo to {self.filename}')
 
 class HeyCyanMessage:
     def __init__(self, msg):
