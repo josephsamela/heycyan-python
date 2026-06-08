@@ -12,7 +12,7 @@ class Text:
         self.origin = origin
 
         # Font size at 1080. This size is scaled relative to window
-        relative_font_size = round(RENDER_RES_HEIGHT*(size/1080))
+        relative_font_size = round(WINDOW_RES_HEIGHT*(size/1080))
         self.f = pygame.font.Font(font, relative_font_size)
 
         self.update(text)
