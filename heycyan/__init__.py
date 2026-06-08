@@ -74,7 +74,7 @@ class HeyCyan:
                 task.cancel()
 
         # Then stop the event loop
-        self._loop.stop()
+        self._loop.call_soon_threadsafe(self._loop.stop)
 
     async def _init(self):
         '''
