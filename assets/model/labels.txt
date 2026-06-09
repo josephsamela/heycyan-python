@@ -1,0 +1,14 @@
+0 Unknown
+1 Ear Muffs
+2 Emergency Lights
+3 Exit Sign
+4 Fire Alarm
+5 Fire Extinguisher
+6 Fire Sprinkler
+7 Goggles
+8 Life Jacket
+9 Respirator
+10 Traffic Cone
+11 Water Sensor
+12 Work Boots
+13 Work Gloves
